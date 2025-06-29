@@ -22,6 +22,7 @@ _LOGGER = logging.getLogger(__name__)
 CONF_COLUMN_NAME = "column"
 CONF_QUERIES = "queries"
 CONF_QUERY = "query"
+CONF_ATTRIBUTE = "attribute"
 
 DB_URL_RE = re.compile("//.*:.*@")
 
@@ -32,9 +33,10 @@ def redact_credentials(data):
 
 
 def validate_sql_select(value):
-    """Validate that value is a SQL SELECT query."""
-    if not value.lstrip().lower().startswith("select"):
-        raise vol.Invalid("Only SELECT queries allowed")
+    """Validate that value is a SQL SELECT or WITH query."""
+    allowed_starts = ("select", "with")
+    if not value.lstrip().lower().startswith(allowed_starts):
+        raise vol.Invalid("Only SELECT or WITH queries are allowed")
     return value
 
 
@@ -45,6 +47,7 @@ _QUERY_SCHEME = vol.Schema(
         vol.Required(CONF_QUERY): vol.All(cv.string, validate_sql_select),
         vol.Optional(CONF_UNIT_OF_MEASUREMENT): cv.string,
         vol.Optional(CONF_VALUE_TEMPLATE): cv.template,
+        vol.Optional(CONF_ATTRIBUTE): cv.string,
     }
 )
 
@@ -62,11 +65,8 @@ def setup_platform(hass, config, add_entities, _discovery_info=None):
     try:
         engine = sqlalchemy.create_engine(db_url)
         sessmaker = scoped_session(sessionmaker(bind=engine))
-
-        # Run a dummy query just to test the db_url
         sess = sessmaker()
         sess.execute(sqlalchemy.text("SELECT 1;"))
-
     except sqlalchemy.exc.SQLAlchemyError as err:
         _LOGGER.error(
             "Couldn't connect using %s DB_URL: %s",
@@ -86,11 +86,11 @@ def setup_platform(hass, config, add_entities, _discovery_info=None):
         unit = query.get(CONF_UNIT_OF_MEASUREMENT)
         value_template = query.get(CONF_VALUE_TEMPLATE)
         column_name = query.get(CONF_COLUMN_NAME)
+        attribute_column = query.get(CONF_ATTRIBUTE)
 
         if value_template is not None:
             value_template.hass = hass
 
-        # MSSQL uses TOP and not LIMIT
         if not ("LIMIT" in query_str or "SELECT TOP" in query_str):
             query_str = (
                 query_str.replace("SELECT", "SELECT TOP 1")
@@ -99,7 +99,7 @@ def setup_platform(hass, config, add_entities, _discovery_info=None):
             )
 
         sensor = SQLSensor(
-            name, sessmaker, query_str, column_name, unit, value_template
+            name, sessmaker, query_str, column_name, unit, value_template, attribute_column
         )
         queries.append(sensor)
 
@@ -109,7 +109,7 @@ def setup_platform(hass, config, add_entities, _discovery_info=None):
 class SQLSensor(SensorEntity):
     """Representation of an SQL sensor."""
 
-    def __init__(self, name, sessmaker, query, column, unit, value_template):
+    def __init__(self, name, sessmaker, query, column, unit, value_template, attribute_column):
         """Initialize the SQL sensor."""
         self._name = name
         self._query = query
@@ -120,9 +120,10 @@ class SQLSensor(SensorEntity):
         self._unit_of_measurement = unit
         self._template = value_template
         self._column_name = column
+        self._attribute_column = attribute_column
         self.sessionmaker = sessmaker
         self._state = None
-        self._attributes = None
+        self._attributes = {}
 
     @property
     def name(self):
@@ -146,7 +147,6 @@ class SQLSensor(SensorEntity):
 
     def update(self):
         """Retrieve sensor data from the query."""
-
         data = None
         try:
             sess = self.sessionmaker()
@@ -165,6 +165,7 @@ class SQLSensor(SensorEntity):
             for res in result.mappings():
                 _LOGGER.debug("result = %s", res.items())
                 data = res[self._column_name]
+
                 for key, value in res.items():
                     if isinstance(value, decimal.Decimal):
                         value = float(value)
@@ -172,11 +173,23 @@ class SQLSensor(SensorEntity):
                         value = str(value)
                     try:
                         value_json = json.loads(value)
-                        if isinstance(value_json, dict) or isinstance(value_json, list):
+                        if isinstance(value_json, (dict, list)):
                             value = value_json
                     except (ValueError, TypeError):
                         pass
                     self._attributes[key] = value
+
+                if self._attribute_column and self._attribute_column in res:
+                    try:
+                        raw_json = res[self._attribute_column]
+                        parsed_json = json.loads(raw_json)
+                        if isinstance(parsed_json, dict):
+                            self._attributes.update(parsed_json)
+                        else:
+                            self._attributes[self._attribute_column] = parsed_json
+                    except (ValueError, TypeError) as err:
+                        _LOGGER.warning("Failed to parse JSON from attribute column '%s': %s", self._attribute_column, err)
+
         except sqlalchemy.exc.SQLAlchemyError as err:
             _LOGGER.error(
                 "Error executing query %s: %s",
